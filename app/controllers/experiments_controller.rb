@@ -17,6 +17,9 @@ class ExperimentsController < AuthController
   class UnknownTypeError < StandardError
   end
 
+  class NoGprError < StandardError
+  end
+
   before_filter :correct_user, :only => [:edit, :update, :delete, :destroy]
 
 
@@ -269,21 +272,293 @@ class ExperimentsController < AuthController
 
   #Function to initiate analysis of individual or multiple experiments 
   def analyze_experiment
-    data = params['data']
-    #redirect_to micro_array_analysis_file_path
-    
-    respond_to do |format|
-    
-    #render :js => "window.location = '#{micro_array_analysis_files_path}'"  
-      
-    format.html { redirect_to micro_array_analysis_files_path }
-        
-    end
+   
+    begin
+      data = params['data'].split(",")
+      logger.debug "=============================" + data.inspect + "=============================="
+   
+      if data.size > 1
+            data.each do |id|
+                @experiment = Experiment.find(id)
+                path = get_paths(id)
+                @probeNames, @sorted_list = readGpr(path)
+                #@micro_array_analysis_file = MicroArrayAnalysisFile.create(experiment_id: @experiment.id)
+            end  
+      else
+            @experiment = Experiment.find(data[0]) 
+            path = get_paths(is)
+            @probeNames, @sorted_list = readGpr(path)  
+            #@micro_array_analysis_file = MicroArrayAnalysisFile.create(experiment_id: @experiment.id)
+      end  
+
+      respond_to do |format|    
+      format.html { redirect_to micro_array_analysis_files_path }
+      end    
+
+    rescue Exception => e
+
+      e.message
+      e.backtrace
+      #raise NoGprError, "File does not seem to be GPR formatted. Check the file!!"
+
+    end   
+
   end  
 
+  #===================================CALCULATE TSI==========================================================
 
-  # DELETE /experiments/1
-  # DELETE /experiments/1.xml
+ #method for parsing gpr file and calculating Total intensities from raw intensities
+ def readGpr(file_path)
+   begin      
+       read = IO.read(file_path)
+             read.encode!('UTF-8', :invalid => :replace, :undef => :replace)
+       read_array = []
+             read_array = read.split("\n") 
+    # if read.valid_encoding?
+       #read_array = read.split("\n")
+  #            
+  #      else
+  #    read_array = read.encode!("ASCII-8BIT","ASCII-8BIT", invalid: :replace, :undef => :replace).split("\n")
+  #      end
+      
+        mod_array = read_array.map {|e| e.split("\t")}  
+        
+        logger.debug @mod_array.to_s + "++++++++++++++++++++++++++++++++++++++++++++++++++++"
+
+
+        element_stabilized = mod_array.map {|element| element.join(",").gsub("\"","").split(",")} 
+
+        header_removed = []
+          if element_stabilized [0].include?("ATF")
+             header_removed = element_stabilized.drop_while {|i| i unless i.include?("Block")}
+          else
+             raise NoGprError, "File does not seem to be GPR formatted. Check the file"
+          end
+
+              column_based_array = header_removed.transpose
+
+              @name, @dia, @f633_mean, @b633_mean = getColumns(column_based_array)
+
+              @probeNames, @sorted_list = calTotalSignalIntensity(@name, @dia, @f633_mean, @b633_mean)
+                  
+              #@filterProbes, @sorted_list = sortGprTsiList(@name, @get_tsi_list)
+              #logger.debug @filterProbes.to_s + "++++++++++++++++++++++++++++++++++++++++++++++++++++"
+              #logger.debug @sorted_list.to_s + "++++++++++++++++++++++++++++++++++++++++++++++++++++"       
+              
+           return @probeNames, @sorted_list
+
+    rescue Exception => e
+              e.message
+              e.backtrace.inspect
+    end 
+
+ end 
+
+ def getColumns(array=[])
+     name, dia, f633_mean, b633_mean = [], [],[],[]
+     begin
+         array.map do |element|     
+             case
+               when element.include?("Name") then name << element
+           #logger.debug name.to_s + "++++++++++++++++++++++++++++++++++++++++++++++++++++"
+               when element.include?("Dia.") then dia << element
+
+           #logger.debug dia.to_s + "++++++++++++++++++++++++++++++++++++++++++++++++++++"
+               when element.include?("F633 Mean") then f633_mean << element
+           #logger.debug f633_mean.to_s + "++++++++++++++++++++++++++++++++++++++++++++++++++++"
+
+               when element.include?("B633 Mean") then b633_mean << element  
+           #logger.debug b633_mean.to_s + "++++++++++++++++++++++++++++++++++++++++++++++++++++"
+     
+             end
+         end
+     
+      rescue Exception => e
+       e.message
+                   e.backtrace.inspect
+      end
+
+    return name, dia, f633_mean, b633_mean 
+ end
+
+ def calTotalSignalIntensity(probeNameList, diameter, foreground, background)
+ 
+   begin 
+
+       names = probeNameList.flatten
+       names.shift
+       filterNames = names.uniq 
+       #logger.debug dia.to_s + "++++++++++++++++++++++++++++++++++++++++++++++++++++"
+
+        dia = diameter.flatten 
+        dia.shift
+       #logger.debug dia.to_s + "++++++++++++++++++++++++++++++++++++++++++++++++++++"
+        f633 = foreground.flatten
+        f633.shift
+       #logger.debug f633.to_s + "++++++++++++++++++++++++++++++++++++++++++++++++++++"      
+        b633 = background.flatten
+        b633.shift
+       #logger.debug b633.to_s + "++++++++++++++++++++++++++++++++++++++++++++++++++++"
+
+
+        names = partition_array(names)
+  counts = names.length
+  
+        R.assign "counts", counts
+  for i in 1..names.count
+   R.assign "name#{i}", names[i-1]
+  end
+
+     #Formula for calculating Total Signal Intensity
+     #(F633_mean - B633_mean)*3.14*diameter^2*1/4
+     dia = partition_array(dia)
+     for i in 1..dia.count
+      R.assign "dia#{i}", dia[i-1]
+     end
+     #R.assign "dia", dia
+
+     f633 = partition_array(f633)
+     for i in 1..f633.count
+      R.assign "f633#{i}", f633[i-1]
+     end
+     #R.assign "f633", f633
+
+     b633 = partition_array(b633)
+     for i in 1..b633.count
+      R.assign "b633#{i}", b633[i-1]
+     end
+     #R.assign "b633", b633
+
+
+  R.eval <<-EOF
+
+
+    mergeVectors <- function(array, counts) {
+      for (i in c(1:counts)) {
+         if (i == 1) { dummy <- c(get(paste0(array,i))) } 
+         else { dummy <- c(dummy, get(paste0(array,i))) }    
+       }
+      return(dummy)
+    }
+
+   names <- mergeVectors("name", counts)
+   names <- as.character(names)
+   dia <- mergeVectors("dia", counts)
+   f633 <- mergeVectors("f633", counts)
+   b633 <- mergeVectors("b633", counts)
+
+  calTSI <- function(dia, f633, b633) {
+    dia <- as.numeric(dia)
+    f633 <- as.numeric(f633)
+    b633 <- as.numeric(b633)
+    tsi <- (f633 - b633) * 3.14 * dia * dia * 1/4
+    return(tsi)
+  } 
+
+
+  calSNR <- function(f633, b633) {
+    f633 <- as.numeric(f633)
+    b633 <- as.numeric(b633)
+    snr <- f633/b633
+    return(snr)
+  }
+
+  totalSignalIntensities <- calTSI(dia, f633, b633)
+
+       names <- as.vector(names)
+       totalSignalIntensities <- as.numeric(totalSignalIntensities)
+
+  tab <- cbind(Name=names, F633=totalSignalIntensities)
+  tab <- data.frame(tab)  
+ 
+  allProbes <- as.character(tab[,1])
+  uniqueProbeVec <- unique(allProbes) 
+        uniqueProbeVecFilter <- gsub("\357\277\275\357\277\275\357\277\275M", "", uniqueProbeVec)
+        print(uniqueProbeVecFilter) 
+
+  meanTSI <- list()
+  myData <- list()
+
+  for (i in c(1:length(uniqueProbeVec))) {
+      
+    myData[[i]] <- subset(tab, uniqueProbeVec[i] == tab[ , 1])
+  } 
+
+  for (j in c(1:length(uniqueProbeVec))) {
+
+                newVec <- as.numeric(as.character(myData[[j]][, 2]))
+                replicate <- as.numeric(length(newVec))
+
+    meanTSI[[j]] <- sum(newVec)/replicate
+                
+
+  }
+
+  meanTSI <- unlist(meanTSI)
+
+   EOF
+            
+      #passing non UTF-8 char from R to ruby and vice versa throws an error... 
+      #"Error in nchar(var) : invalid multibyte string 1". 
+      #here is a workaround.
+      #Sys.setlocale('LC_ALL','C')
+      #http://stackoverflow.com/questions/6669911/error-in-nchar-when-reading-in-stata-file-in-r-on-mac
+
+     #Splitting with in R
+     #split(a, ceiling(seq_along(a)/3))
+
+          
+            #tsi = R.pull("totalSignalIntensities")
+           tsiList = R.pull("meanTSI")
+           return filterNames, tsiList
+
+
+   rescue Exception => e
+        e.message
+        e.backtrace.inspect
+   end 
+
+ end
+
+ def partition_array(array=[], size=500)
+    dummy = []
+       begin
+    if array.empty?
+       raise "Input array is empty!!"
+    else
+    array.each_slice(size) {|element| dummy.push(element)}
+    end
+       rescue Exception => e
+       e.message
+       end     
+
+     return dummy 
+ end
+
+      
+
+#==================================INPUT FILE HANDLING============================================
+
+ #method for fetching saved file path based on retrived upload ID from database
+ #ID is required to fetch session specific file.
+ def get_paths(id)
+     #use ID argument to fetch that particular record.
+     #with the help of id fetch the file names from database
+     @gprId = Experiment.find(id).microarraygpr_id
+     @gpr = Microarraygpr.find(@gprId) 
+     gpr_title = @gpr.gpr_title
+     gpr_dir = @gpr.gpr_dir
+     gpr_path = File.join("#{Rails.root}", "#{gpr_dir}", "#{gpr_title}")
+
+     logger.debug "=======================" + gpr_path.to_s + "==========================="
+
+     return gpr_path
+ end
+
+#===================================================================================================#
+
+# DELETE /experiments/1
+# DELETE /experiments/1.xml
   def destroy
     if !signed_in_and_master?
       flash[:notice] = "Sorry. Only technical manager can delete data. Please, contact Roberto SPURIO to do it."
